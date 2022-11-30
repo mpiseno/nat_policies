@@ -3,13 +3,14 @@ import os
 import numpy as np
 
 
+CLIPORT_DATAPATH = '../cliport/data/put-block-in-bowl-unseen-colors-test/'
+OUR_DATAPATH = 'data/put-block-in-bowl-unseen-colors/'
+
 
 def main():
-    cliport_datapath = '../cliport/data/put-block-in-bowl-seen-colors-train/'
-
     triples = []
-    cliport_rgb_path = os.path.join(cliport_datapath, 'color')
-    cliport_info_path = os.path.join(cliport_datapath, 'info')
+    cliport_rgb_path = os.path.join(CLIPORT_DATAPATH, 'color')
+    cliport_info_path = os.path.join(CLIPORT_DATAPATH, 'info')
     for episode_file in sorted(os.listdir(cliport_rgb_path)):
         rgb_episode_path = os.path.join(cliport_rgb_path, episode_file)
         info_episode_path = os.path.join(cliport_info_path, episode_file)
@@ -28,9 +29,8 @@ def main():
                 'goal_img': goal_img
             })
 
-    our_datapath = 'data/put-block-in-bowl-seen-colors-train/'
     for i, trip in enumerate(triples):
-        trip_filepath = os.path.join(our_datapath, f'triple_{i}.npy')
+        trip_filepath = os.path.join(OUR_DATAPATH, f'triple_{i}.npy')
         np.save(trip_filepath, trip, allow_pickle=True)
 
 

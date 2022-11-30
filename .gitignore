@@ -1,5 +1,15 @@
 data/
+data_clip_finetune/
 wandb/
+natpol/
+visuals/
+finetune/
+logs/
+exps/
+.hydra/
 
+slurm*
 *.egg*
 *.DS_Store
+
+eval.log

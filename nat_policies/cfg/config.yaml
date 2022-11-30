@@ -1,0 +1,7 @@
+# Shared Config
+
+cliport_root_dir: ${env:CLIPORT_ROOT} # set this ENV variable if you didn't `python setup.py develop`
+natpol_root_dir: ${env:NAT_POLICIES_ROOT}
+
+tag: default
+debug: False

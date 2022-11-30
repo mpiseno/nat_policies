@@ -1,0 +1,51 @@
+# Finetuning CLIP
+
+defaults:
+  - config
+
+hydra:
+  run:
+    dir: ${train.finetune_dir}
+
+dataset:
+  type: 'single' # 'single' or 'multi'
+  images: True
+  cache: True # load episodes to memory instead of reading from disk
+  augment:
+    theta_sigma: 60 # rotation sigma in degrees; N(mu = 0, sigma = theta_sigma).
+
+train:
+  # folders
+  finetune_folder: finetune
+  data_dir: ${cliport_root_dir}/data
+  finetune_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task}-${tag}
+
+  # task configs
+  task: ''              # best practice: Set this from command line
+  agent: finetune_clip
+  clip_variant: ''      # best practice: Set this from command line
+  n_demos: 1000
+  n_finetune_epochs: 500
+
+  # hyper params
+  batch_size: 128
+
+  # script configs
+  gpu: [0] # -1 for all
+  log: False # log metrics and stats to wandb
+  n_val: 100
+
+  # LP / FT config
+  LP_phase: True
+  LP_tag: ''            # best practice: Set this from command line
+  LP_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task}-${train.LP_tag}
+
+wandb:
+  logger:
+    project: nat_policies
+    tags: []
+    group: train
+    offline: False
+  saver:
+    upload: False
+    monitor: 'val_loss'
