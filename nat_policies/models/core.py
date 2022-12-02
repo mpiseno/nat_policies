@@ -6,23 +6,19 @@ from cliport.models.core.clip import CLIP, convert_weights, load_clip
 
 
 class RoboCLIP(nn.Module):
-    def __init__(self, clip_variant, LP_phase=False, device='cpu'):
+    def __init__(self, clip_variant, fusion_type, LP_phase=False, device='cpu'):
         super(RoboCLIP, self).__init__()
         assert clip_variant in ['RN50', 'ViT']
+        assert fusion_type in ['add', 'concat', 'FiLM']
         self.clip_variant = 'RN50' if clip_variant == 'RN50' else 'ViT-B/32'
+        self.fusion_type = fusion_type
         self.LP_phase = LP_phase
+
+        if self.fusion_type == 'add':
+            assert(self.LP_phase == False, 'fusion type add does not require LP')
+
         self.clip_finetuned_layers = []
-        if self.LP_phase:
-            if self.clip_variant == 'RN50':
-                raise Exception() # TODO: fill this out
-                self.clip_finetuned_layers = []
-            elif self.clip_variant == 'ViT-B/32':
-                # LP phase needs to also modify vision layers
-                self.clip_finetuned_layers = [
-                    'visual.transformer.resblocks.11',
-                    'visual.ln_post'
-                ]
-        else:
+        if not self.LP_phase:
             if self.clip_variant == 'RN50':
                 raise Exception() # TODO: fill this out
                 self.clip_finetuned_layers = []
@@ -30,34 +26,32 @@ class RoboCLIP(nn.Module):
                 # FT phase needs to finetune both vision and lang
                 self.clip_finetuned_layers = [
                     'visual.transformer.resblocks.11', 'visual.ln_post',  # Vision layers
-                    'transformer.resblocks.11',                 # Lang layers
-                    'ln_final'
+                    'transformer.resblocks.11', 'ln_final'                 # Lang layers
                 ]
+            else:
+                raise Exception()
 
         self.device = device
+        self.trained_layers = []
         self._build_model()
 
     def _freeze_clip_layers(self, clip_model):
-        trained_layers = []
         for name, param in clip_model.named_parameters():
             param.requires_grad = False
             if any([name.startswith(layer) for layer in self.clip_finetuned_layers]):
                 param.requires_grad = True
-                trained_layers.append(name)
+                self.trained_layers.append(name)
 
         # Make sure to handle unnamed parameters!!!
         clip_model.logit_scale.requires_grad = False
-        if self.clip_variant == 'ViT-B/32':
-            clip_model.visual.proj.requires_grad = True
-            trained_layers.append('visual_projection')
-
         if self.LP_phase:
             clip_model.text_projection.requires_grad = False
+            clip_model.visual.proj.requires_grad = False
         else:
             clip_model.text_projection.requires_grad = True
-            trained_layers.append('text_projection')
-        
-        return trained_layers
+            clip_model.visual.proj.requires_grad = True
+            self.trained_layers.append('text_projection')
+            self.trained_layers.append('visual_projection')
 
     def _build_model(self):
         model, _ = load_clip(self.clip_variant, device=self.device) # Loads the CLIP model from original CLIP repo
@@ -65,18 +59,37 @@ class RoboCLIP(nn.Module):
         del model
         
         self.clip = clip
-        trained_layers = self._freeze_clip_layers(self.clip)
+        self._freeze_clip_layers(self.clip)
 
         self.clip_embed_dim = self.clip.text_projection.shape[1]
-        self.fusion = nn.Sequential(
-            nn.Linear(2 * self.clip_embed_dim, self.clip_embed_dim),
-            nn.ReLU(),
-            nn.Linear(self.clip_embed_dim, self.clip_embed_dim)
-        )
-        self.logit_scale = nn.Parameter(self.clip.logit_scale.clone(), requires_grad=True)
+        if self.fusion_type == 'concat':
+            self.fusion = nn.Sequential(
+                nn.Linear(2 * self.clip_embed_dim, self.clip_embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.clip_embed_dim, self.clip_embed_dim)
+            )
+            self.trained_layers.append('fusion_concat')
+        elif self.fusion_type == 'FiLM':
+            # This is the film generator
+            film_dim = 512
+            self.film_gen = nn.Sequential(
+                nn.Linear(self.clip_embed_dim, film_dim),
+                nn.GELU(),
+                nn.Linear(film_dim, film_dim),
+                nn.GELU(),
+            )
+            self.gamma_head = nn.Linear(film_dim, self.clip_embed_dim)
+            self.beta_head = nn.Linear(film_dim, self.clip_embed_dim)
+            self.trained_layers.append('fusion_film')
+        elif self.fusion_type == 'add':
+            pass
+        else:
+            raise Exception()
 
-        trained_layers.extend(['logit_scale', 'fusion'])
-        print(f'RoboCLIP trained layers: {trained_layers}')
+        self.logit_scale = nn.Parameter(self.clip.logit_scale.clone(), requires_grad=True)
+        if self.logit_scale.requires_grad: self.trained_layers.append('logit_scale')
+        
+        print(f'RoboCLIP trained layers: {self.trained_layers}')
         
     def encode_image(self, img):
         return self.clip.encode_image(img)
@@ -89,9 +102,19 @@ class RoboCLIP(nn.Module):
         lang_embedding = self.encode_text(lang)
         in_dtype = img_embedding.dtype
 
-        fusion_input = torch.cat((img_embedding, lang_embedding), dim=-1).to(torch.float32)
-        fused_embedding = self.fusion(fusion_input).to(in_dtype)
-        return fused_embedding, img_embedding, lang_embedding
+        if self.fusion_type == 'concat':
+            fusion_input = torch.cat((img_embedding, lang_embedding), dim=-1).to(torch.float32)
+            pred_embedding = self.fusion(fusion_input).to(in_dtype)
+        elif self.fusion_type == 'FiLM':
+            film_generator_input = lang_embedding.to(torch.float32)
+            film_hidden = self.film_gen(film_generator_input)    # FiLM generator
+            gamma = self.gamma_head(film_hidden).to(in_dtype)
+            beta = self.beta_head(film_hidden).to(in_dtype)
+            pred_embedding = gamma * img_embedding + beta # FiLM
+        elif self.fusion_type == 'add':
+            pred_embedding = img_embedding + lang_embedding
+
+        return pred_embedding, img_embedding, lang_embedding
 
 
 def build_model(state_dict: dict):

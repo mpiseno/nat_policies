@@ -46,7 +46,8 @@ def main(cfg):
 
     # Handle FT phase
     LP_checkpoint_path = None
-    if not LP_phase:
+    should_load_ckpt = not LP_phase and cfg['train']['fusion_type'] != 'add'
+    if should_load_ckpt:
         # Get LP checkpoint
         LP_run_dir = cfg['train']['LP_dir']
         LP_checkpoint_path = os.path.join(LP_run_dir, 'checkpoints', 'best.ckpt')

@@ -23,6 +23,7 @@ train:
   # task configs
   task: ''              # best practice: Set this from command line
   agent: finetune_clip
+  fusion_type: 'add'    # can be 'add' 'concat' or 'FiLM'
   clip_variant: ''      # best practice: Set this from command line
   n_demos: 1000
   n_finetune_epochs: 500

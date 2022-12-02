@@ -9,7 +9,10 @@ from pytorch_lightning import LightningModule
 from cliport.utils import utils
 from cliport.models.core.clip import tokenize
 from nat_policies.models.core import RoboCLIP
-from nat_policies.utils.eval_utils import ground_truth_L2, cross_batch_L2, knn_classification, start_pred_goal_ratio
+from nat_policies.utils.eval_utils import (
+    ground_truth_L2, cross_batch_L2, knn_classification, start_pred_goal_ratio,
+    ground_truth_cossim, cross_batch_cossim
+)
 from nat_policies.utils.common import count_parameters
 
 
@@ -29,8 +32,10 @@ class FinetuneCLIPAgent(LightningModule):
         self.total_steps = 0
 
         self.LP_phase = cfg['train']['LP_phase']
+        self.fusion_type = cfg['train']['fusion_type']
         self.roboclip = RoboCLIP(
             clip_variant=cfg['train']['clip_variant'],
+            fusion_type=self.fusion_type,
             LP_phase=self.LP_phase,
             device=self.device_type
         )
@@ -47,7 +52,7 @@ class FinetuneCLIPAgent(LightningModule):
         self.ce_loss_vis = nn.CrossEntropyLoss()
         self.ce_loss_fusion = nn.CrossEntropyLoss()
 
-        print("Agent: {}, Logging: {}".format(name, cfg['train']['log']))
+        print(f'Fusion type: {self.fusion_type}')
         print(f'Num trainable parameters: {n_trainable_after}')
         print(f'LP Phase: {self.LP_phase}')
 
@@ -65,7 +70,7 @@ class FinetuneCLIPAgent(LightningModule):
         pred_goal_embeddings_normalized = pred_goal_embeddings / pred_goal_embeddings.norm(dim=1, keepdim=True)
         goal_embeddings_normalized = goal_embeddings / goal_embeddings.norm(dim=1, keepdim=True)
 
-        # Compute similarity matrix for (start_img+lang_goal, goal_img) pairs
+        # # Compute similarity matrix for (start_img+lang_goal, goal_img) pairs
         logit_scale = self.roboclip.logit_scale.exp()
         logits_per_pred_goal = logit_scale * pred_goal_embeddings_normalized @ goal_embeddings_normalized.t()
         logits_per_goal = logits_per_pred_goal.t()
@@ -76,12 +81,6 @@ class FinetuneCLIPAgent(LightningModule):
             self.ce_loss_vis(logits_per_goal, ground_truth)
         ) / 2
         loss = goal_similarity_loss
-
-        # if self.finetune_clip_layers:
-        #     # # Compute an extra similarity matrix just for language pairs (to prevent degenerate solution)
-        #     # logits_per_text = logit_scale * lang_embeddings_normalized @ lang_embeddings_normalized.t()
-        #     # lang_similarity_loss = self.ce_loss_lang(logits_per_text, ground_truth)
-        #     # loss += lang_similarity_loss
 
         emb_data = None
         if return_emb:
@@ -103,14 +102,74 @@ class FinetuneCLIPAgent(LightningModule):
         lang_goals = tokenize(lang_goals).to(self.device_type)
         return start_imgs, lang_goals, goal_imgs
 
+    def compute_stats_and_log(self, loss, emb_data, is_train):
+        tag = 'train' if is_train else 'val'
+        with torch.no_grad():
+            start_embeddings, lang_embeddings, pred_goal_embeddings, goal_embeddings = (
+                emb_data['start_embeddings_normalized'],
+                emb_data['lang_embeddings_normalized'],
+                emb_data['pred_goal_embeddings_normalized'],
+                emb_data['goal_embeddings_normalized']
+            )
+
+            pred_goal_start_img_dist = ground_truth_L2(pred_goal_embeddings, start_embeddings)
+            pred_goal_real_goal_dist = ground_truth_L2(pred_goal_embeddings, goal_embeddings)
+            pred_goal_start_img_sim = ground_truth_cossim(pred_goal_embeddings, start_embeddings)
+            pred_goal_real_goal_sim = ground_truth_cossim(pred_goal_embeddings, goal_embeddings)
+            
+            start_img_goal_img_dist = ground_truth_L2(start_embeddings, goal_embeddings)
+            cross_batch_start_img_dist = cross_batch_L2(start_embeddings, start_embeddings)
+            cross_batch_goal_img_dist = cross_batch_L2(goal_embeddings, goal_embeddings)
+            cross_batch_lang_dist = cross_batch_L2(lang_embeddings, lang_embeddings)
+            start_img_goal_img_sim = ground_truth_cossim(start_embeddings, goal_embeddings)
+            cross_batch_start_img_sim = cross_batch_cossim(start_embeddings, start_embeddings)
+            cross_batch_goal_img_sim = cross_batch_cossim(goal_embeddings, goal_embeddings)
+            cross_batch_lang_sim = cross_batch_cossim(lang_embeddings, lang_embeddings)
+
+            top_1_l2, top_5_l2, top_1_cosine, top_5_cosine = knn_classification(
+                pred_goal_embeddings, goal_embeddings, K=5
+            )
+        
+        self.log(f'{tag}/loss', loss.detach().item())
+
+        self.log(f'{tag}/pred_goal_2_start_img_dist', pred_goal_start_img_dist)
+        self.log(f'{tag}/pred_goal_2_goal_img_dist', pred_goal_real_goal_dist)
+        self.log(f'{tag}/pred_goal_2_start_img_sim', pred_goal_start_img_sim)
+        self.log(f'{tag}/pred_goal_2_goal_img_sim', pred_goal_real_goal_sim)
+
+        self.log(f'{tag}/start_img_2_goal_img_dist', start_img_goal_img_dist)
+        self.log(f'{tag}/cross_batch_start_img_dist', cross_batch_start_img_dist)
+        self.log(f'{tag}/cross_batch_goal_img_dist', cross_batch_goal_img_dist)
+        self.log(f'{tag}/cross_batch_lang_dist', cross_batch_lang_dist)
+        self.log(f'{tag}/start_img_2_goal_img_sim', start_img_goal_img_sim)
+        self.log(f'{tag}/cross_batch_start_img_sim', cross_batch_start_img_sim)
+        self.log(f'{tag}/cross_batch_goal_img_sim', cross_batch_goal_img_sim)
+        self.log(f'{tag}/cross_batch_lang_sim', cross_batch_lang_sim)
+
+        self.log(f'{tag}/top_1_acc_L2', top_1_l2)
+        self.log(f'{tag}/top_5_acc_L2', top_5_l2)
+        self.log(f'{tag}/top_1_acc_cosine', top_1_cosine)
+        self.log(f'{tag}/top_5_acc_cosine', top_5_cosine)
+
+        print(f'{tag} loss: {loss}')
+
     '''Overridden methods for PyTorch Lightning'''
     
     def configure_optimizers(self):
         if self.LP_phase:
-            optimizer = torch.optim.Adam(
-                self.roboclip.parameters(),
-                lr=1e-4, betas=(0.9, 0.98), eps=1e-6
-            )
+            if self.fusion_type == 'FiLM':
+                params = (
+                    list(self.roboclip.film_gen.parameters()) +
+                    list(self.roboclip.gamma_head.parameters()) +
+                    list(self.roboclip.beta_head.parameters()) +
+                    [self.roboclip.logit_scale]
+                )
+            elif self.fusion_type == 'concat':
+                params = (
+                    list(self.roboclip.fusion.parameters()) +
+                    [self.roboclip.logit_scale]
+                )
+            optimizer = torch.optim.Adam(params, lr=1e-5)
         else:
             optimizer = torch.optim.Adam(
                 self.roboclip.parameters(),
@@ -129,9 +188,8 @@ class FinetuneCLIPAgent(LightningModule):
         self.roboclip.train()
 
         start_imgs, lang_goals, goal_imgs = self.preprocess_batch(batch)
-        loss, _ = self.contrastive_loss(start_imgs, lang_goals, goal_imgs, return_emb=False)
-
-        self.log('train/loss', loss.detach().item())
+        loss, emb_data = self.contrastive_loss(start_imgs, lang_goals, goal_imgs, return_emb=True)
+        self.compute_stats_and_log(loss, emb_data, is_train=True)
 
         return loss
     
@@ -141,35 +199,7 @@ class FinetuneCLIPAgent(LightningModule):
         start_imgs, lang_goals, goal_imgs = self.preprocess_batch(batch)
         with torch.no_grad():
             loss, emb_data = self.contrastive_loss(start_imgs, lang_goals, goal_imgs, return_emb=True)
-            start_embeddings, lang_embeddings, pred_goal_embeddings, goal_embeddings = (
-                emb_data['start_embeddings_normalized'],
-                emb_data['lang_embeddings_normalized'],
-                emb_data['pred_goal_embeddings_normalized'],
-                emb_data['goal_embeddings_normalized']
-            )
-            start_embeddings_unnormalized = emb_data['start_embeddings_unnormalized']
-            goal_embeddings_unnormalized = emb_data['goal_embeddings_unnormalized']
-
-            pred_goal_real_goal_dist = ground_truth_L2(pred_goal_embeddings, goal_embeddings)
-            pred_goal_start_img_dist = ground_truth_L2(pred_goal_embeddings, start_embeddings)
-            start_img_goal_img_dist = ground_truth_L2(start_embeddings, goal_embeddings)
-            cross_batch_goal_dist = cross_batch_L2(pred_goal_embeddings, goal_embeddings)
-            cross_batch_start_img_dist = cross_batch_L2(start_embeddings, start_embeddings)
-            cross_batch_lang_dist = cross_batch_L2(lang_embeddings, lang_embeddings)
-            top_1_acc, top_5_acc = knn_classification(pred_goal_embeddings, goal_embeddings, K=5)
-        
-        self.log('val/loss', loss.detach().item())
-        self.log('val/pred_goal_2_goal_img_dist', pred_goal_real_goal_dist)
-        self.log('val/pred_goal_2_start_img_dist', pred_goal_start_img_dist)
-        self.log('val/start_img_2_goal_img_dist', start_img_goal_img_dist)
-        self.log('val/cross_batch_goal_dist', cross_batch_goal_dist)
-        self.log('val/top_1_acc', top_1_acc)
-        self.log('val/top_5_acc', top_5_acc)
-        
-        self.log('val/cross_batch_start_img_dist', cross_batch_start_img_dist)
-        self.log('val/cross_batch_lang_dist', cross_batch_lang_dist)
-
-        print(f'Val loss: {loss}')
+            self.compute_stats_and_log(loss, emb_data, is_train=False)
 
         return dict(
             val_loss=loss
