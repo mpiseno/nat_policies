@@ -12,7 +12,4 @@ slurm*
 *.egg*
 *.DS_Store
 
-__pycache__/
-*.py[cod]
-
 eval.log

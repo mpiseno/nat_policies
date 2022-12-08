@@ -284,7 +284,8 @@ class RavensDataset(Dataset):
 
         # Return random observation action pair (and goal) from episode.
         i = np.random.choice(range(len(episode)-1))
-        g = i+1 #if is_sequential_task else -1
+        g = i+1 if is_sequential_task else -1
+        #g = i + 1
         sample, goal = episode[i], episode[g]
 
         # Process sample.
