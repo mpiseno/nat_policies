@@ -1,63 +1,50 @@
-import os
-from PIL import Image
-
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.transforms import Compose, Resize, RandomCrop, ToTensor, Normalize, CenterCrop
 
 import cliport.models as models
-import cliport.models.core.fusion as fusion
 
-from nat_policies.models.roboclip import RoboCLIP
-
-from cliport.utils import utils
 from cliport.agents.transporter_lang_goal import TwoStreamClipLingUNetTransporterAgent
-from cliport.models.core.clip import build_model, load_clip, tokenize
+from nat_policies.utils.preprocessing import preprocess_rgb
+
+from cliport.models.streams.two_stream_attention_lang_fusion import TwoStreamAttentionLangFusionLat
+from cliport.models.streams.two_stream_transport_lang_fusion import TwoStreamTransportLangFusionLat
+from cliport.models.core.clip import build_model, load_clip
 from cliport.models.core import fusion
 from cliport.models.resnet import IdentityBlock, ConvBlock
 from cliport.models.core.unet import Up
 from cliport.models.core.fusion import FusionConvLat
-from cliport.models.streams.two_stream_attention_lang_fusion import TwoStreamAttentionLangFusionLat
-from cliport.models.streams.two_stream_transport_lang_fusion import TwoStreamTransportLangFusionLat
 
 
-class RoboCLIPAgent(TwoStreamClipLingUNetTransporterAgent):
+class CLIPortVisualGoalAgent(TwoStreamClipLingUNetTransporterAgent):
     def __init__(self, name, cfg, train_ds, test_ds):
-        self.use_gt_goals = cfg['train']['use_gt_goals']
         super().__init__(name, cfg, train_ds, test_ds)
-
-        print(f'Using GT Image Goals: {self.use_gt_goals}')
 
     def _build_model(self):
         stream_one_fcn = 'plain_resnet_lat'
-        stream_two_fcn = (
-            'roboclip_lingunet_lat' if not self.use_gt_goals
-            else 'roboclip_lingunet_lat_gt_vis'
-        )
-        self.attention = RoboCLIPAttention(
+        stream_two_fcn = 'cliport_visual_lingunet_let'
+        self.attention = TwoStreamAttentionVisualGoalFusionLat(
             stream_fcn=(stream_one_fcn, stream_two_fcn),
             in_shape=self.in_shape,
             n_rotations=1,
-            preprocess=utils.preprocess,
+            preprocess=preprocess_rgb,
             cfg=self.cfg,
             device=self.device_type,
         )
-        self.transport = RoboCLIPTransport(
+        self.transport = TwoStreamTransportVisualGoalFusionLat(
             stream_fcn=(stream_one_fcn, stream_two_fcn),
             in_shape=self.in_shape,
             n_rotations=self.n_rotations,
             crop_size=self.crop_size,
-            preprocess=utils.preprocess,
+            preprocess=preprocess_rgb,
             cfg=self.cfg,
             device=self.device_type
         )
-    
+
     def attn_forward(self, inp, softmax=True):
         inp_img = inp['inp_img']
-        goal = inp['goal_img'] if self.use_gt_goals else inp['lang_goal']
+        goal = inp['goal_img']
 
         out = self.attention.forward(inp_img, goal, softmax=softmax)
         return out
@@ -75,7 +62,7 @@ class RoboCLIPAgent(TwoStreamClipLingUNetTransporterAgent):
     def trans_forward(self, inp, softmax=True):
         inp_img = inp['inp_img']
         p0 = inp['p0']
-        goal = inp['goal_img'] if self.use_gt_goals else inp['lang_goal']
+        goal = inp['goal_img']
 
         out = self.transport.forward(inp_img, p0, goal, softmax=softmax)
         return out
@@ -84,10 +71,9 @@ class RoboCLIPAgent(TwoStreamClipLingUNetTransporterAgent):
         inp_img = frame['img']
         p0 = frame['p0']
         p1, p1_theta = frame['p1'], frame['p1_theta']
-        lang_goal = frame['lang_goal']
         goal_img = frame['goal_img']
 
-        inp = {'inp_img': inp_img, 'p0': p0, 'lang_goal': lang_goal, 'goal_img': goal_img}
+        inp = {'inp_img': inp_img, 'p0': p0, 'goal_img': goal_img}
         out = self.trans_forward(inp, softmax=False)
         err, loss = self.transport_criterion(backprop, compute_err, inp, out, p0, p1, p1_theta)
         return loss, err
@@ -137,12 +123,14 @@ class RoboCLIPAgent(TwoStreamClipLingUNetTransporterAgent):
         }
 
 
-class RoboCLIPAttention(TwoStreamAttentionLangFusionLat):
-    """Language-Conditioned Attention (a.k.a Pick) module with lateral connections."""
 
-    def __init__(self, stream_fcn, in_shape, n_rotations, preprocess, cfg, device):
+class TwoStreamAttentionVisualGoalFusionLat(TwoStreamAttentionLangFusionLat):
+    """Two Stream Visual Goal-Conditioned Attention (a.k.a Pick) module."""
+
+    def __init__(
+        self, stream_fcn, in_shape, n_rotations, preprocess, cfg, device
+    ):
         self.fusion_type = cfg['train']['attn_stream_fusion_type']
-        self.use_gt_goals = cfg['train']['use_gt_goals']
         super().__init__(stream_fcn, in_shape, n_rotations, preprocess, cfg, device)
 
     def _build_nets(self):
@@ -155,50 +143,15 @@ class RoboCLIPAttention(TwoStreamAttentionLangFusionLat):
         self.fusion = fusion.names[self.fusion_type](input_dim=1)
 
         print(f"Attn FCN - Stream One: {stream_one_fcn}, Stream Two: {stream_two_fcn}, Stream Fusion: {self.fusion_type}")
-    
-    def forward(self, inp_img, goal, softmax=True):
-        """Forward pass."""
-        in_data = np.pad(inp_img, self.padding, mode='constant')
-        in_shape = (1,) + in_data.shape
-        in_data = in_data.reshape(in_shape)
-        in_tens = torch.from_numpy(in_data).to(dtype=torch.float, device=self.device)  # [B W H 6]
-
-        # Rotation pivot.
-        pv = np.array(in_data.shape[1:3]) // 2
-
-        # Rotate input.
-        in_tens = in_tens.permute(0, 3, 1, 2)  # [B 6 W H]
-        in_tens = in_tens.repeat(self.n_rotations, 1, 1, 1)
-        in_tens = self.rotator(in_tens, pivot=pv)
-
-        # Forward pass.
-        logits = []
-        for x in in_tens:
-            lgts = self.attend(x, goal)
-            logits.append(lgts)
-        logits = torch.cat(logits, dim=0)
-
-        # Rotate back output.
-        logits = self.rotator(logits, reverse=True, pivot=pv)
-        logits = torch.cat(logits, dim=0)
-        c0 = self.padding[:2, 0]
-        c1 = c0 + inp_img.shape[:2]
-        logits = logits[:, :, c0[0]:c1[0], c0[1]:c1[1]]
-
-        logits = logits.permute(1, 2, 3, 0)  # [B W H 1]
-        output = logits.reshape(1, np.prod(logits.shape))
-        if softmax:
-            output = F.softmax(output, dim=-1)
-            output = output.reshape(logits.shape[1:])
-        return output
 
 
-class RoboCLIPTransport(TwoStreamTransportLangFusionLat):
-    """Two Stream Transport (a.k.a Place) module with lateral connections"""
+class TwoStreamTransportVisualGoalFusionLat(TwoStreamTransportLangFusionLat):
+    """Two Stream Transport (a.k.a Place) module"""
 
-    def __init__(self, stream_fcn, in_shape, n_rotations, crop_size, preprocess, cfg, device):
+    def __init__(
+        self, stream_fcn, in_shape, n_rotations, crop_size, preprocess, cfg, device
+    ):
         self.fusion_type = cfg['train']['trans_stream_fusion_type']
-        self.use_gt_goals = cfg['train']['use_gt_goals']
         super().__init__(stream_fcn, in_shape, n_rotations, crop_size, preprocess, cfg, device)
 
     def _build_nets(self):
@@ -216,14 +169,11 @@ class RoboCLIPTransport(TwoStreamTransportLangFusionLat):
         print(f"Transport FCN - Stream One: {stream_one_fcn}, Stream Two: {stream_two_fcn}, Stream Fusion: {self.fusion_type}")
 
 
-class RoboCLIPLingUNetLat(nn.Module):
-    """
-    CLIP RN50 with U-Net skip connections and lateral connections. This is almost identical to the
-    CLIPLingUNetLat model from CLIPort, but CLIP is fine-tuned to enforce visual-language dynamics
-    """
+class CLIPVisualLingUNetLat(nn.Module):
+    """ CLIP RN50 with U-Net skip connections and lateral connections """
 
     def __init__(self, input_shape, output_dim, cfg, device, preprocess):
-        super(RoboCLIPLingUNetLat, self).__init__()
+        super(CLIPVisualLingUNetLat, self).__init__()
         self.input_shape = input_shape
         self.output_dim = output_dim
         self.input_dim = 2048  # penultimate layer channel-size of CLIP-RN50
@@ -231,37 +181,22 @@ class RoboCLIPLingUNetLat(nn.Module):
         self.device = device
         self.batchnorm = self.cfg['train']['batchnorm']
         self.goal_fusion_type = self.cfg['train']['goal_fusion_type']
-        self.use_gt_goals = self.cfg['train']['use_gt_goals']
         self.bilinear = True
         self.up_factor = 2 if self.bilinear else 1
         self.preprocess = preprocess
 
-        roboclip_ckpt_path = os.path.join(
-            os.environ['NAT_POLICIES_ROOT'],
-            cfg['train']['roboclip_ckpt_path']
-        )
-        clip_variant = 'RN50'
-        self.roboclip = RoboCLIP(clip_variant=clip_variant, device=device)
-        self.roboclip.inference_mode(ckpt_path=roboclip_ckpt_path)
+        self._load_clip()
         self._build_decoder()
 
-        self.transporter_depth_mean = 0.00509261
-        self.transporter_depth_std = 0.00903967
-        self.transforms_goal = Compose([
-            Resize(224, interpolation=Image.BICUBIC),
-            CenterCrop(224),
-            lambda image: image.convert("RGB"),
-            ToTensor(),
-            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        ])
-        self.transforms_rgb = Compose([
-            lambda image: image.convert("RGB"),
-            ToTensor(),
-            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        ])
         self.padding = [(0, 0), (80, 80), (0, 0)]
 
+    def _load_clip(self):
+        model, _ = load_clip("RN50", device=self.device)
+        self.clip_rn50 = build_model(model.state_dict()).to(self.device)
+        del model
+
     def _build_decoder(self):
+        # language
         self.goal_fuser1 = fusion.names[self.goal_fusion_type](input_dim=self.input_dim // 2)
         self.goal_fuser2 = fusion.names[self.goal_fusion_type](input_dim=self.input_dim // 4)
         self.goal_fuser3 = fusion.names[self.goal_fusion_type](input_dim=self.input_dim // 8)
@@ -310,57 +245,58 @@ class RoboCLIPLingUNetLat(nn.Module):
             nn.Conv2d(16, self.output_dim, kernel_size=1)
         )
 
-    def encode_text(self, x):
+    def encode_image(self, img):
         with torch.no_grad():
-            tokens = tokenize([x]).to(self.device)
-            text_feat, text_emb = self.clip.encode_text_with_embeddings(tokens)
+            img_encoding, img_im = self.clip_rn50.visual.prepool_im(img)
 
-        text_mask = torch.where(tokens==0, tokens, 1)  # [1, max_token_len]
-        return text_feat, text_emb, text_mask
+        return img_encoding, img_im
 
-    def preprocess_rgb(self, img):
-        # NOTE: unfortunately have to do this slow operation to convert each image to PIL image for preprocessing
-        rgb_batch = img[:, :3]
-        rgb_batch = rgb_batch.permute(0, 2, 3, 1).cpu().numpy()
-        rgb_batch = [Image.fromarray(rgb.astype(np.uint8)) for rgb in rgb_batch]
-        rgb_batch = [self.transforms_rgb(rgb).unsqueeze(0) for rgb in rgb_batch]
-        rgb_batch = torch.cat(rgb_batch, dim=0).to(dtype=torch.float, device=self.device)
-        return rgb_batch
-    
-    def compute_goal(self, goal):
-        # Predict the goal
-        assert(False, 'Fix the preprocessing here')
-        rgb_tilde = x[:, :3].detach()
-        rgb_tilde = tvF.resize(rgb_tilde, (224, 224))
-        rgb_tilde = self.preprocess(rgb_tilde, dist='clip')
+    def encode_image_goal(self, goal_img):
         with torch.no_grad():
-            lang = tokenize([lang]).to(self.device)
-            pred_goal, _, _ = self.roboclip(rgb_tilde, lang)
-        
-        return self._forward(x, lat, pred_goal)
-    
-    def _forward(self, rgb, lat, goal):
-        x = rgb
+            img_encoding = self.clip_rn50.visual(goal_img)
+
+        return img_encoding
+
+    def preprocess_goal(self, goal):
+        img_unprocessed_goal = np.pad(goal, self.padding, mode='constant')
+        img_unprocessed_goal = np.resize(img_unprocessed_goal, (224, 224, 6))
+        input_data_goal = img_unprocessed_goal
+        in_shape_goal = (1,) + input_data_goal.shape
+        input_data_goal = input_data_goal.reshape(in_shape_goal)
+        in_tensor_goal = torch.from_numpy(input_data_goal).to(
+            dtype=torch.float, device=self.device
+        ).permute(0, 3, 1, 2)
+        return in_tensor_goal
+
+    def forward(self, x, lat, g):
+        x = self.preprocess(x, dist='clip')
+        g = self.preprocess_goal(g)
+        g = self.preprocess(g, dist='clip')
+
         in_type = x.dtype
         in_shape = x.shape
-        with torch.no_grad():
-            pre_attnpool_acts, intermediates = self.roboclip.clip.visual.prepool_im(rgb)
+        x = x[:,:3]  # select RGB
+        g = g[:,:3]
 
-        pre_attnpool_acts = pre_attnpool_acts.to(in_type)
-        goal = goal.to(in_type)
-        assert pre_attnpool_acts.shape[1] == self.input_dim
+        x, im = self.encode_image(x)
+        x = x.to(in_type)
 
-        x = self.conv1(pre_attnpool_acts)
-        x = self.goal_fuser1(x, goal, x2_proj=self.goal_proj1)
-        x = self.up1(x, intermediates[-2])
+        g = self.encode_image_goal(g)
+        g = g.to(in_type)
+        
+        assert x.shape[1] == self.input_dim
+        x = self.conv1(x)
+
+        x = self.goal_fuser1(x, g, x2_proj=self.goal_proj1)
+        x = self.up1(x, im[-2])
         x = self.lat_fusion1(x, lat[-6])
 
-        x = self.goal_fuser2(x, goal, x2_proj=self.goal_proj2)
-        x = self.up2(x, intermediates[-3])
+        x = self.goal_fuser2(x, g, x2_proj=self.goal_proj2)
+        x = self.up2(x, im[-3])
         x = self.lat_fusion2(x, lat[-5])
 
-        x = self.goal_fuser3(x, goal, x2_proj=self.goal_proj3)
-        x = self.up3(x, intermediates[-4])
+        x = self.goal_fuser3(x, g, x2_proj=self.goal_proj3)
+        x = self.up3(x, im[-4])
         x = self.lat_fusion3(x, lat[-4])
 
         x = self.layer1(x)
@@ -377,31 +313,5 @@ class RoboCLIPLingUNetLat(nn.Module):
         x = F.interpolate(x, size=(in_shape[-2], in_shape[-1]), mode='bilinear')
         return x
 
-    def forward(self, x, lat, goal):
-        rgb = self.preprocess_rgb(x)
-        goal_emb = self.compute_goal(goal)
-        return self._forward(rgb, lat, goal_emb)
 
-
-class RoboCLIPLingUNetLat_GTVis(RoboCLIPLingUNetLat):
-    def __init__(self, input_shape, output_dim, cfg, device, preprocess):
-        super(RoboCLIPLingUNetLat_GTVis, self).__init__(
-            input_shape, output_dim, cfg, device, preprocess
-        )
-
-    def preprocess_goal(self, goal):
-        rgb_g = goal[..., :3]
-        rgb_g = np.pad(rgb_g, self.padding, mode='constant')
-        rgb_g = Image.fromarray(rgb_g.astype(np.uint8))
-        rgb_g = self.transforms_goal(rgb_g)
-        return rgb_g.unsqueeze(0).to(device=self.device)
-
-    def compute_goal(self, goal):
-        assert not isinstance(goal, str)
-        goal = self.preprocess_goal(goal)
-        goal = self.roboclip.encode_image(goal)
-        return goal
-
-
-models.names['roboclip_lingunet_lat'] = RoboCLIPLingUNetLat
-models.names['roboclip_lingunet_lat_gt_vis'] = RoboCLIPLingUNetLat_GTVis
+models.names['cliport_visual_lingunet_let'] = CLIPVisualLingUNetLat

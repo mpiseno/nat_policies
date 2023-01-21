@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-from nat_policies.datasets import RavensFinetuneDataset
+from nat_policies.datasets import RoboCLIPDataset
 from nat_policies.agents.finetune_clip_agent import FinetuneCLIPAgent
 
 
@@ -31,13 +31,13 @@ def main(cfg):
 
     # Config
     data_dir = cfg['train']['data_dir']
-    task = cfg['train']['task']
+    task_group = cfg['train']['task_group']
     agent_type = cfg['train']['agent']
     n_demos = cfg['train']['n_demos']
     n_val = cfg['train']['n_val']
-    LP_phase = cfg['train']['LP_phase']
+    #LP_phase = cfg['train']['LP_phase']
     max_epochs = cfg['train']['n_finetune_epochs']
-    name = '{}-{}-{}'.format(task, agent_type, n_demos)
+    name = '{}-{}-{}'.format(task_group, agent_type, n_demos)
     batch_size = cfg['train']['batch_size']
     slurm_n_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', 1))
     num_workers = max(1, slurm_n_cpus - 1)
@@ -45,21 +45,25 @@ def main(cfg):
     print(f'Num workers for dataloaders: {num_workers}')
 
     # Handle FT phase
-    LP_checkpoint_path = None
-    should_load_ckpt = not LP_phase and cfg['train']['fusion_type'] != 'add'
-    if should_load_ckpt:
-        # Get LP checkpoint
-        LP_run_dir = cfg['train']['LP_dir']
-        LP_checkpoint_path = os.path.join(LP_run_dir, 'checkpoints', 'best.ckpt')
-        assert os.path.exists(LP_checkpoint_path)
+    checkpoint_path = None
+    if len(cfg['train']['checkpoint']) > 0:
+        # Get checkpoint path
+        checkpoint_path = os.path.join(
+            os.environ['NAT_POLICIES_ROOT'],
+            cfg['train']['checkpoint']
+        )
+        assert os.path.exists(checkpoint_path)
 
     # Datasets
-    train_ds = RavensFinetuneDataset(
-        os.path.join(data_dir, '{}-train'.format(task)), cfg, n_demos=n_demos, augment=True
+    train_ds = RoboCLIPDataset(
+        data_dir, cfg, group=task_group, mode='train',
+        n_demos=n_demos, augment=True
     )
+    
     train_dl = DataLoader(train_ds, batch_size=batch_size, num_workers=num_workers)
-    val_ds = RavensFinetuneDataset(
-        os.path.join(data_dir, '{}-val'.format(task)), cfg, n_demos=n_val, augment=False
+    val_ds = RoboCLIPDataset(
+        data_dir, cfg, group=task_group, mode='val',
+        n_demos=n_val, augment=False
     )
     val_batch_size = 10 if cfg['debug'] else len(val_ds)
     val_dl = DataLoader(val_ds, batch_size=val_batch_size, num_workers=num_workers)
@@ -69,6 +73,7 @@ def main(cfg):
         gpus=cfg['train']['gpu'],
         logger=wandb_logger,
         checkpoint_callback=checkpoint_callback,
+        resume_from_checkpoint=checkpoint_path,
         max_epochs=max_epochs,
         automatic_optimization=True,
         check_val_every_n_epoch=2,
@@ -76,7 +81,14 @@ def main(cfg):
     )
 
     # Initialize agent
-    agent = FinetuneCLIPAgent(name, cfg, train_dl, val_dl, model_ckpt_path=LP_checkpoint_path)
+    if checkpoint_path is None:
+        agent = FinetuneCLIPAgent(name, cfg, train_dl, val_dl)
+    else:
+        agent = FinetuneCLIPAgent.load_from_checkpoint(
+            checkpoint_path,
+            name=name, cfg=cfg,
+            train_dataloader=train_dl, val_dataloader=val_dl
+        )
 
     # Main training loop
     trainer.fit(agent)

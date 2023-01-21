@@ -7,7 +7,9 @@ import os
 from PIL import Image
 
 import clip
+import torch
 import numpy as np
+import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose, Resize, RandomCrop, ToTensor, Normalize, CenterCrop
@@ -24,29 +26,30 @@ from cliport.tasks import cameras
 from cliport.utils import utils
 
 
-class CLIPortDataset(Dataset):
-    def __init__(self, data_path, clip_preprocess=None):
-        self.data_path = data_path
-        self.preprocess = clip_preprocess
-
-        self.triple_filepaths = sorted(os.listdir(self.data_path))
-
-    def __len__(self):
-        return len(self.triple_filepaths)
-
-    def __getitem__(self, index):
-        triple = np.load(
-            os.path.join(self.data_path, self.triple_filepaths[index]),
-            allow_pickle=True
-        )[()]
-        start_img, lang_goal, goal_img = triple['start_img'], triple['lang_goal'], triple['goal_img']
-
-        if self.preprocess is not None:
-            start_img = self.preprocess(Image.fromarray(start_img))
-            goal_img = self.preprocess(Image.fromarray(goal_img))
-            lang_goal = clip.tokenize([lang_goal])
-
-        return (start_img, lang_goal, goal_img)
+ALL_TASKS = [
+    'align-box-corner',
+    'assembling-kits',
+    'block-insertion',
+    'manipulating-rope',
+    'packing-boxes',
+    'palletizing-boxes',
+    'place-red-in-green',
+    'stack-block-pyramid',
+    'sweeping-piles',
+    'towers-of-hanoi',
+    'align-rope',
+    'assembling-kits-seq-unseen-colors',
+    'packing-boxes-pairs-seen-colors',
+    'packing-boxes-pairs-unseen-colors',
+    'packing-shapes',
+    'packing-unseen-google-objects-seq',
+    'packing-unseen-google-objects-group',
+    'put-block-in-bowl-seen-colors',
+    'put-block-in-bowl-unseen-colors',
+    'stack-block-pyramid-seq-unseen-colors',
+    'separating-piles-unseen-colors',
+    'towers-of-hanoi-seq-unseen-colors',
+]
 
 
 class RavensDataset(Dataset):
@@ -93,7 +96,6 @@ class RavensDataset(Dataset):
             episodes = np.random.choice(range(self.n_episodes), self.n_demos, False)
             self.set(episodes)
 
-
     def add(self, seed, episode):
         """Add an episode to the dataset.
 
@@ -133,24 +135,24 @@ class RavensDataset(Dataset):
         """Limit random samples to specific fixed set."""
         self.sample_set = episodes
 
+    def load_field(self, episode_id, field, fname, cache=False):
+        # Check if sample is in cache.
+        if cache:
+            if episode_id in self._cache:
+                if field in self._cache[episode_id]:
+                    return self._cache[episode_id][field]
+            else:
+                self._cache[episode_id] = {}
+
+        # Load sample from files.
+        path = os.path.join(self._path, field)
+        data = pickle.load(open(os.path.join(path, fname), 'rb'))
+        if cache:
+            self._cache[episode_id][field] = data
+
+        return data
+
     def load(self, episode_id, images=True, cache=False):
-        def load_field(episode_id, field, fname):
-
-            # Check if sample is in cache.
-            if cache:
-                if episode_id in self._cache:
-                    if field in self._cache[episode_id]:
-                        return self._cache[episode_id][field]
-                else:
-                    self._cache[episode_id] = {}
-
-            # Load sample from files.
-            path = os.path.join(self._path, field)
-            data = pickle.load(open(os.path.join(path, fname), 'rb'))
-            if cache:
-                self._cache[episode_id][field] = data
-            return data
-
         # Get filename and random seed used to initialize episode.
         seed = None
         path = os.path.join(self._path, 'action')
@@ -159,11 +161,11 @@ class RavensDataset(Dataset):
                 seed = int(fname[(fname.find('-') + 1):-4])
 
                 # Load data.
-                color = load_field(episode_id, 'color', fname)
-                depth = load_field(episode_id, 'depth', fname)
-                action = load_field(episode_id, 'action', fname)
-                reward = load_field(episode_id, 'reward', fname)
-                info = load_field(episode_id, 'info', fname)
+                color = self.load_field(episode_id, 'color', fname)
+                depth = self.load_field(episode_id, 'depth', fname)
+                action = self.load_field(episode_id, 'action', fname)
+                reward = self.load_field(episode_id, 'reward', fname)
+                info = self.load_field(episode_id, 'info', fname)
 
                 # Reconstruct episode.
                 episode = []
@@ -192,6 +194,19 @@ class RavensDataset(Dataset):
                               hmap[Ellipsis, None],
                               hmap[Ellipsis, None]), axis=2)
         assert img.shape == self.in_shape, img.shape
+        return img
+
+    def apply_clip_preprocessing(self, img, is_goal=False):
+        rgb = img[..., :3]
+        rgb = np.pad(rgb, self.padding, mode='constant')
+        rgb = Image.fromarray(rgb.astype(np.uint8))
+        rgb = self.transforms_goal(rgb) if is_goal else self.transforms_rgb(rgb)
+        depth = img[..., 3:]
+        import pdb; pdb.set_trace()
+        depth = np.pad(depth, self.padding, mode='constant')
+        depth = (depth - self.transporter_depth_mean) / self.transporter_depth_std
+        depth = torch.as_tensor(depth).permute(2, 0, 1)
+        img = torch.cat((rgb, depth), dim=0)
         return img
 
     def process_sample(self, datum, augment=True):
@@ -268,7 +283,7 @@ class RavensDataset(Dataset):
     def __len__(self):
         return len(self.sample_set)
 
-    def __getitem__(self, idx, choose_random=True):
+    def __getitem__(self, idx, choose_random=True, return_seed=False):
         if choose_random:
             if len(self.sample_set) > 0:
                 episode_id = np.random.choice(self.sample_set)
@@ -277,7 +292,7 @@ class RavensDataset(Dataset):
         else:
             episode_id = idx
 
-        episode, _ = self.load(episode_id, self.images, self.cache)
+        episode, seed = self.load(episode_id, self.images, self.cache)
 
         # Is the task sequential like stack-block-pyramid-seq?
         is_sequential_task = '-seq' in self._path.split("/")[-1]
@@ -285,52 +300,14 @@ class RavensDataset(Dataset):
         # Return random observation action pair (and goal) from episode.
         i = np.random.choice(range(len(episode)-1))
         g = i+1 if is_sequential_task else -1
-        #g = i + 1
+        
         sample, goal = episode[i], episode[g]
 
         # Process sample.
         sample = self.process_sample(sample, augment=self.augment)
         goal = self.process_goal(goal, perturb_params=sample['perturb_params'])
-
+        sample['goal_img'] = goal['img'].copy()
         return sample, goal
-
-
-
-class RavensFinetuneDataset(RavensDataset):
-    def __init__(self, path, cfg, n_demos=0, augment=False):
-        super().__init__(path, cfg, n_demos, augment)
-
-        # Transforms used by CLIP model
-        self.transforms = Compose([
-            Resize(224, interpolation=Image.BICUBIC),
-            CenterCrop(224),
-            lambda image: image.convert("RGB"),
-            ToTensor(),
-            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        ])
-        self.padding = [(0, 0), (80, 80), (0, 0)]
-
-    def __len__(self):
-        return super().__len__()
-
-    def __getitem__(self, idx):
-        sample, goal = super().__getitem__(idx)
-
-        start_img_rgb = sample['img'][..., :3]
-        start_img_rgb = np.pad(start_img_rgb, self.padding, mode='constant')
-        start_img_rgb = Image.fromarray(start_img_rgb.astype(np.uint8))
-        start_img_rgb = self.transforms(start_img_rgb)
-
-        goal_img_rgb = goal['img'][..., :3]
-        goal_img_rgb = np.pad(goal_img_rgb, self.padding, mode='constant')
-        goal_img_rgb = Image.fromarray(goal_img_rgb.astype(np.uint8))
-        goal_img_rgb = self.transforms(goal_img_rgb)
-
-        return dict(
-            start_img=start_img_rgb,
-            lang_goal=sample['lang_goal'],
-            goal_img=goal_img_rgb
-        )
 
 
 class RavensMultiTaskDataset(RavensDataset):
@@ -779,9 +756,11 @@ class RavensMultiTaskDataset(RavensDataset):
             # Select random episode depending on the size of the dataset.
             episodes[task] = np.random.choice(range(n_episodes), min(self.n_demos, n_episodes), False)
 
+        self._cache = {}
+
         if self.n_demos > 0:
             self.images = self.cfg['dataset']['images']
-            self.cache = False # TODO(mohit): fix caching for multi-task dataset
+            #self.cache = False # TODO(mohit): fix caching for multi-task dataset
             self.set(episodes)
 
         self._path = None
@@ -795,16 +774,19 @@ class RavensMultiTaskDataset(RavensDataset):
         avg_episodes = total_episodes // len(self.sample_set)
         return avg_episodes
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, choose_random=True):
         # Choose random task.
         self._task = np.random.choice(self.tasks)
         self._path = os.path.join(self.root_path, f'{self._task}')
 
         # Choose random episode.
-        if len(self.sample_set[self._task]) > 0:
+        assert len(self.sample_set[self._task]) > 0
+
+        if choose_random:
             episode_id = np.random.choice(self.sample_set[self._task])
         else:
-            episode_id = np.random.choice(range(self.n_episodes[self._task]))
+            episode_id = idx
+
         episode, _ = self.load(episode_id, self.images, self.cache)
 
         # Is the task sequential like stack-block-pyramid-seq?
@@ -827,23 +809,120 @@ class RavensMultiTaskDataset(RavensDataset):
     def add(self, seed, episode):
         raise Exception("Adding tasks not supported with multi-task dataset")
 
+    def load_field(self, episode_id, field, fname, cache=False):
+        # Check if sample is in cache.
+        if cache:
+            if (
+                (self._task in self._cache) and
+                (episode_id in self._cache[self._task]) and
+                (field in self._cache[self._task][episode_id])
+            ):
+                return self._cache[self._task][episode_id][field]
+            else:
+                self._cache[episode_id] = {}
+
+        # Load sample from files.
+        path = os.path.join(self._path, field)
+        data = pickle.load(open(os.path.join(path, fname), 'rb'))
+        if cache:
+            self._cache[self._task][episode_id][field] = data
+
+        return data
+
     def load(self, episode_id, images=True, cache=False):
-        if self.attr_train_task is None or self.mode in ['val', 'test']:
-            self._task = np.random.choice(self.tasks)
-        else:
-            all_other_tasks = list(self.tasks)
-            all_other_tasks.remove(self.attr_train_task)
-            all_tasks = [self.attr_train_task] + all_other_tasks # add seen task in the front
+        # if self.attr_train_task is None or self.mode in ['val', 'test']:
+        #     self._task = np.random.choice(self.tasks)
+        # else:
+        #     all_other_tasks = list(self.tasks)
+        #     all_other_tasks.remove(self.attr_train_task)
+        #     all_tasks = [self.attr_train_task] + all_other_tasks # add seen task in the front
 
-            # 50% chance of sampling the main seen task and 50% chance of sampling any other seen-unseen task
-            mult_attr_seen_sample_prob = 0.5
-            sampling_probs = [(1-mult_attr_seen_sample_prob) / (len(all_tasks)-1)] * len(all_tasks)
-            sampling_probs[0] = mult_attr_seen_sample_prob
+        #     # 50% chance of sampling the main seen task and 50% chance of sampling any other seen-unseen task
+        #     mult_attr_seen_sample_prob = 0.5
+        #     sampling_probs = [(1-mult_attr_seen_sample_prob) / (len(all_tasks)-1)] * len(all_tasks)
+        #     sampling_probs[0] = mult_attr_seen_sample_prob
 
-            self._task = np.random.choice(all_tasks, p=sampling_probs)
+        #     self._task = np.random.choice(all_tasks, p=sampling_probs)
 
+        # NOTE: Make sure self._task is set properly in methods that call load()
         self._path = os.path.join(self.root_path, f'{self._task}-{self.mode}')
         return super().load(episode_id, images, cache)
 
     def get_curr_task(self):
         return self._task
+
+
+class RoboCLIPDataset(RavensMultiTaskDataset):
+    ROBOCLIP_MULTI_TASKS = {
+        'multi-roboclip-small-group': {
+            'train': [
+                #'packing-boxes-pairs-seen-colors',
+                'packing-shapes',
+                'put-block-in-bowl-seen-colors'
+            ],
+            'val': [
+                #'packing-boxes-pairs-seen-colors',
+                'packing-shapes',
+                'put-block-in-bowl-seen-colors'
+            ],
+            'test': [
+                #'packing-boxes-pairs-seen-colors',
+                'packing-shapes',
+                'put-block-in-bowl-seen-colors'
+            ]
+        }
+    }
+    def __init__(self, path, cfg, group, mode, n_demos=100, augment=False):
+        self.update_multi_task_dict()
+        super(RoboCLIPDataset, self).__init__(path, cfg, group, mode, n_demos, augment)
+
+        # Transforms used by CLIP model
+        self.transforms = Compose([
+            Resize(224, interpolation=Image.BICUBIC),
+            CenterCrop(224),
+            lambda image: image.convert("RGB"),
+            ToTensor(),
+            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        ])
+        self.padding = [(0, 0), (80, 80), (0, 0)]
+    
+    def update_multi_task_dict(self):
+        self.MULTI_TASKS.update(self.ROBOCLIP_MULTI_TASKS)
+
+        # Also want the option to use this as a single task dataset
+        SINGLE_TASKS = {
+            task: {
+                'train': [task],
+                'val': [task],
+                'test': [task]
+            } for task in ALL_TASKS
+        }
+        self.MULTI_TASKS.update(SINGLE_TASKS)
+
+    def __len__(self):
+        total_episodes = 0
+        for _, episode_ids in self.sample_set.items():
+            total_episodes += len(episode_ids)
+    
+        return total_episodes
+
+    def __getitem__(self, idx, choose_random=True):
+        sample, goal = super().__getitem__(idx, choose_random=choose_random)
+    
+        start_img_rgb = sample['img'][..., :3]
+        #plt.imsave(f'rgb{idx}.png', start_img_rgb.astype(np.uint8))
+        start_img_rgb = np.pad(start_img_rgb, self.padding, mode='constant')
+        start_img_rgb = Image.fromarray(start_img_rgb.astype(np.uint8))
+        start_img_rgb = self.transforms(start_img_rgb)
+
+        goal_img_rgb = goal['img'][..., :3]
+        #plt.imsave(f'goal{idx}.png', goal_img_rgb.astype(np.uint8))
+        goal_img_rgb = np.pad(goal_img_rgb, self.padding, mode='constant')
+        goal_img_rgb = Image.fromarray(goal_img_rgb.astype(np.uint8))
+        goal_img_rgb = self.transforms(goal_img_rgb)
+
+        return dict(
+            start_img=start_img_rgb,
+            lang_goal=sample['lang_goal'],
+            goal_img=goal_img_rgb
+        )

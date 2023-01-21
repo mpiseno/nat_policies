@@ -26,35 +26,19 @@ cd $REPO_PATH
 conda activate michael_nat_policies # Set your conda environment
 
 # Variables for config (see nat_policies/cfg/finetune_clip.yaml)
-CLIP_VARIANT=ViT
-LP_TAG=finetune_clip_ViT_fusion-FiLM_LP
-FT_TAG=finetune_clip_ViT_fusion-FiLM_FT
+CLIP_VARIANT=RN50
+EXP_TAG=roboclip_RN50_FiLM_cont
 
-
-# LP phase - for concat and FiLM fusion
-# srun --output ${SLURM_LOG_DIR}/${LP_TAG}.out \
-#     python nat_policies/train_latent_dynamics.py train.task=put-block-in-bowl-seen-colors \
-#                         tag=${LP_TAG} \
-#                         train.fusion_type=FiLM \
-#                         train.LP_phase=True \
-#                         train.clip_variant=${CLIP_VARIANT} \
-#                         train.log=True \
-#                         train.n_demos=1000 \
-#                         train.n_finetune_epochs=101 \
-#                         dataset.cache=True \
-
-# FT phase - for concat and FiLM fusion
-srun --output ${SLURM_LOG_DIR}/${FT_TAG}.out \
+srun --output ${SLURM_LOG_DIR}/${EXP_TAG}.out \
     python nat_policies/train_latent_dynamics.py train.task=put-block-in-bowl-seen-colors \
-                        tag=${FT_TAG} \
-                        train.fusion_type=FiLM \
-                        train.LP_phase=False \
-                        train.LP_tag=${LP_TAG} \
+                        tag=${EXP_TAG} \
                         train.clip_variant=${CLIP_VARIANT} \
                         train.log=True \
+                        train.batch_size=2048 \
                         train.n_demos=1000 \
-                        train.n_finetune_epochs=501 \
+                        train.n_finetune_epochs=5001 \
                         dataset.cache=True \
+                        train.checkpoint=finetune/put-block-in-bowl-seen-colors-roboclip_RN50_FiLM/checkpoints/last.ckpt
                         
                         
 

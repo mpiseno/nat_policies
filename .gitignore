@@ -9,7 +9,10 @@ exps/
 .hydra/
 
 slurm*
+*.ckpt
+
 *.egg*
 *.DS_Store
+*/__pycache__/*
 
 eval.log

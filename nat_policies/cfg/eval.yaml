@@ -32,10 +32,12 @@ exp_folder: exps
 data_dir: ${cliport_root_dir}/data
 assets_root: ${cliport_root_dir}/cliport/environments/assets/
 
-model_path: ${model_dir}/${exp_folder}/${model_task}-${agent}-n${train_demos}-train/checkpoints/ # path to pre-trained models
-train_config: ${model_dir}/${exp_folder}/${model_task}-${agent}-n${train_demos}-train/.hydra/config.yaml # path to train config
-save_path: ${model_dir}/${exp_folder}/${eval_task}-${agent}-n${train_demos}-train/checkpoints/ # path to save results
-results_path: ${model_dir}/${exp_folder}/${eval_task}-${agent}-n${train_demos}-train/checkpoints/ # path to existing results
+train_tag: ''
+model_path: ${model_dir}/${exp_folder}/${model_task}-${agent}-n${train_demos}-${train_tag}-train/checkpoints/ # path to pre-trained models
+
+train_config: ${model_dir}/${exp_folder}/${model_task}-${agent}-n${train_demos}-${train_tag}-train/.hydra/config.yaml # path to train config
+save_path: ${model_dir}/${exp_folder}/${eval_task}-${agent}-n${train_demos}-${train_tag}-train/checkpoints/ # path to save results
+results_path: ${model_dir}/${exp_folder}/${eval_task}-${agent}-n${train_demos}-${train_tag}-train/checkpoints/ # path to existing results
 
 
 # record videos (super slow)

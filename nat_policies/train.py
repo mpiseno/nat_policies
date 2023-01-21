@@ -8,8 +8,13 @@ from pathlib import Path
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+
+import cliport.agents as agents
+
+from nat_policies.agents import (
+    CLIPortVisualGoalAgent, RoboCLIPAgent
+)
 from nat_policies.datasets import RavensDataset, RavensMultiTaskDataset
-from nat_policies.agents.transporter_roboclip_agent import RoboclipAgent
 
 
 @hydra.main(config_path="./cfg", config_name='train')
@@ -17,7 +22,7 @@ def main(cfg):
     # Logger
     wandb_logger = WandbLogger(
         project=cfg['wandb']['logger']['project'], name=cfg['tag']
-    ) if cfg['train']['log'] else None
+    ) if (cfg['train']['log'] and not cfg['debug']) else None
 
     # Checkpoint saver
     hydra_dir = Path(os.getcwd())
@@ -35,7 +40,7 @@ def main(cfg):
     max_epochs = cfg['train']['n_steps'] // cfg['train']['n_demos']
     trainer = Trainer(
         gpus=cfg['train']['gpu'],
-        fast_dev_run=cfg['debug'],
+        fast_dev_run=False, #cfg['debug'],
         logger=wandb_logger,
         checkpoint_callback=checkpoint_callback,
         max_epochs=max_epochs,
@@ -62,16 +67,23 @@ def main(cfg):
 
     # Datasets
     dataset_type = cfg['dataset']['type']
+    use_visual_goals = cfg['train']['use_gt_goals']
     if 'multi' in dataset_type:
         train_ds = RavensMultiTaskDataset(data_dir, cfg, group=task, mode='train', n_demos=n_demos, augment=True)
         val_ds = RavensMultiTaskDataset(data_dir, cfg, group=task, mode='val', n_demos=n_val, augment=False)
     else:
-        train_ds = RavensDataset(os.path.join(data_dir, '{}-train'.format(task)), cfg, n_demos=n_demos, augment=True)
-        val_ds = RavensDataset(os.path.join(data_dir, '{}-val'.format(task)), cfg, n_demos=n_val, augment=False)
-
+        train_ds = RavensDataset(
+            os.path.join(data_dir, '{}-train'.format(task)), cfg, n_demos=n_demos, augment=True,
+        )
+        val_ds = RavensDataset(
+            os.path.join(data_dir, '{}-val'.format(task)), cfg, n_demos=n_val, augment=False,
+        )
+    
     # Initialize agent
-    if agent_type == "roboclip":
-        agent = RoboclipAgent(name, cfg, train_ds, val_ds)
+    if agent_type == 'cliport_visual':
+        agent = CLIPortVisualGoalAgent(name, cfg, train_ds, val_ds)
+    elif agent_type == 'roboclip':
+        agent = RoboCLIPAgent(name, cfg, train_ds, val_ds)
     elif agent_type in agents.names:
         agent = agents.names[agent_type](name, cfg, train_ds, val_ds)
     else:

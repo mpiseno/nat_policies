@@ -8,7 +8,7 @@ from pytorch_lightning import LightningModule
 
 from cliport.utils import utils
 from cliport.models.core.clip import tokenize
-from nat_policies.models.core import RoboCLIP
+from nat_policies.models.roboclip import RoboCLIP
 from nat_policies.utils.eval_utils import (
     ground_truth_L2, cross_batch_L2, knn_classification, start_pred_goal_ratio,
     ground_truth_cossim, cross_batch_cossim
@@ -17,7 +17,7 @@ from nat_policies.utils.common import count_parameters
 
 
 class FinetuneCLIPAgent(LightningModule):
-    def __init__(self, name, cfg, train_dataloader, val_dataloader, model_ckpt_path=None):
+    def __init__(self, name, cfg, train_dataloader, val_dataloader):
         super().__init__()
         utils.set_seed(0)
 
@@ -28,33 +28,17 @@ class FinetuneCLIPAgent(LightningModule):
         self.val_dl = val_dataloader
 
         self.name = name
-        self.task = cfg['train']['task']
         self.total_steps = 0
 
-        self.LP_phase = cfg['train']['LP_phase']
-        self.fusion_type = cfg['train']['fusion_type']
         self.roboclip = RoboCLIP(
             clip_variant=cfg['train']['clip_variant'],
-            fusion_type=self.fusion_type,
-            LP_phase=self.LP_phase,
             device=self.device_type
         )
-        n_trainable_before = count_parameters(self.roboclip, count_trainable_only=True)
-        if model_ckpt_path is not None:
-            print(f'Loading model ckpt from: {model_ckpt_path}')
-            ckpt = torch.load(model_ckpt_path)
-            model_state_dict = ckpt['state_dict']
-            self.load_state_dict(model_state_dict)
-
-        n_trainable_after = count_parameters(self.roboclip, count_trainable_only=True)
-        assert n_trainable_before == n_trainable_after
+        n_trainable = count_parameters(self.roboclip, count_trainable_only=True)
 
         self.ce_loss_vis = nn.CrossEntropyLoss()
         self.ce_loss_fusion = nn.CrossEntropyLoss()
-
-        print(f'Fusion type: {self.fusion_type}')
-        print(f'Num trainable parameters: {n_trainable_after}')
-        print(f'LP Phase: {self.LP_phase}')
+        print(f'Num trainable parameters: {n_trainable}')
 
     '''Loss computation methods'''
 
@@ -70,7 +54,7 @@ class FinetuneCLIPAgent(LightningModule):
         pred_goal_embeddings_normalized = pred_goal_embeddings / pred_goal_embeddings.norm(dim=1, keepdim=True)
         goal_embeddings_normalized = goal_embeddings / goal_embeddings.norm(dim=1, keepdim=True)
 
-        # # Compute similarity matrix for (start_img+lang_goal, goal_img) pairs
+        # Compute similarity matrix for (start_img+lang_goal, goal_img) pairs
         logit_scale = self.roboclip.logit_scale.exp()
         logits_per_pred_goal = logit_scale * pred_goal_embeddings_normalized @ goal_embeddings_normalized.t()
         logits_per_goal = logits_per_pred_goal.t()
@@ -156,25 +140,10 @@ class FinetuneCLIPAgent(LightningModule):
     '''Overridden methods for PyTorch Lightning'''
     
     def configure_optimizers(self):
-        if self.LP_phase:
-            if self.fusion_type == 'FiLM':
-                params = (
-                    list(self.roboclip.film_gen.parameters()) +
-                    list(self.roboclip.gamma_head.parameters()) +
-                    list(self.roboclip.beta_head.parameters()) +
-                    [self.roboclip.logit_scale]
-                )
-            elif self.fusion_type == 'concat':
-                params = (
-                    list(self.roboclip.fusion.parameters()) +
-                    [self.roboclip.logit_scale]
-                )
-            optimizer = torch.optim.Adam(params, lr=1e-5)
-        else:
-            optimizer = torch.optim.Adam(
-                self.roboclip.parameters(),
-                lr=1e-5, betas=(0.9, 0.98), eps=1e-6
-            )
+        optimizer = torch.optim.Adam(
+            self.roboclip.parameters(),
+            lr=1e-5, betas=(0.9, 0.98), eps=1e-6
+        )
 
         return optimizer
 

@@ -18,28 +18,30 @@ train:
   # folders
   finetune_folder: finetune
   data_dir: ${cliport_root_dir}/data
-  finetune_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task}-${tag}
+  finetune_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task_group}-${tag}
 
   # task configs
-  task: ''              # best practice: Set this from command line
+  task_group: ''              # best practice: Set this from command line
   agent: finetune_clip
-  fusion_type: 'add'    # can be 'add' 'concat' or 'FiLM'
+  #fusion_type: 'FiLM'    # can be 'add' 'concat' or 'FiLM'
   clip_variant: ''      # best practice: Set this from command line
-  n_demos: 1000
+  n_demos: 1000          # NOTE: This is per-task. So if the task_group has 2 tasks, it will be 2 * n_demos
   n_finetune_epochs: 500
 
   # hyper params
-  batch_size: 128
+  batch_size: 256
 
   # script configs
   gpu: [0] # -1 for all
   log: False # log metrics and stats to wandb
   n_val: 100
 
+  checkpoint: ''
+
   # LP / FT config
-  LP_phase: True
-  LP_tag: ''            # best practice: Set this from command line
-  LP_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task}-${train.LP_tag}
+  # LP_phase: True
+  # LP_tag: ''            # best practice: Set this from command line
+  # LP_dir: ${natpol_root_dir}/${train.finetune_folder}/${train.task_group}-${train.LP_tag}
 
 wandb:
   logger:

@@ -3,14 +3,22 @@
 import os
 import pickle
 import json
+import random
 
 import numpy as np
+import matplotlib.pyplot as plt
 import hydra
+
 from cliport import agents
-from cliport import dataset
 from cliport import tasks
 from cliport.utils import utils
 from cliport.environments.environment import Environment
+
+from nat_policies.datasets import RavensDataset
+from nat_policies.agents import RoboCLIPAgent
+
+
+agents.names['roboclip'] = RoboCLIPAgent
 
 
 @hydra.main(config_path='./cfg', config_name='eval')
@@ -43,7 +51,7 @@ def main(vcfg):
                                             n_demos=vcfg['n_demos'],
                                             augment=False)
     else:
-        ds = dataset.RavensDataset(os.path.join(vcfg['data_dir'], f"{eval_task}-{mode}"),
+        ds = RavensDataset(os.path.join(vcfg['data_dir'], f"{eval_task}-{mode}"),
                                    tcfg,
                                    n_demos=vcfg['n_demos'],
                                    augment=False)
@@ -85,7 +93,6 @@ def main(vcfg):
 
         # Run testing for each training run.
         for train_run in range(vcfg['n_repeats']):
-
             # Initialize agent.
             utils.set_seed(train_run, torch=True)
             agent = agents.names[vcfg['agent']](name, tcfg, None, ds)
@@ -105,6 +112,10 @@ def main(vcfg):
                 total_reward = 0
                 np.random.seed(seed)
 
+                # NOTE: This is super important!!! random package is what chooses the object colors. Not np.random
+                # use commented code below to sanity check images
+                random.seed(seed)
+
                 # set task
                 if 'multi' in dataset_type:
                     task_name = ds.get_curr_task()
@@ -120,6 +131,17 @@ def main(vcfg):
                 obs = env.reset()
                 info = env.info
                 reward = 0
+
+                ### For making sure goal from dataset and current obs from env agree
+                # print(info['lang_goal'])
+                # print(episode[0][-1]['lang_goal'])
+                # img = ds.get_image(obs)
+                # obs_goal, _, _, _ = goal
+                # img_goal = ds.get_image(obs_goal)
+                # rgb = img[..., :3].astype(np.uint8)
+                # rgb_goal = img_goal[..., :3].astype(np.uint8)
+                # plt.imsave('rgb.png', rgb)
+                # plt.imsave('rgb_goal.png', rgb_goal)
 
                 # Start recording video (NOTE: super slow)
                 if record:
